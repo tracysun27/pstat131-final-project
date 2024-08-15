@@ -1,0 +1,1070 @@
+---
+title: "PSTAT 131 Final Project"
+author: "Tracy Sun"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+## Premise
+
+r/AmITheAsshole is a popular subreddit where users can post about a
+situation and ask for feedback on who was in the wrong. Possible
+judgments include YTA/YWBTA (you're the asshole / you would be the
+asshole), NTA/YWNBTA (not the asshole / you wouldn't be the asshole),
+ESH (everyone sucks here), NAH (no assholes here), and INFO (more
+information needed). These scenarios range from mild to extreme and it
+is often hard to form a quick judgment on a situation from the title or
+the first few sentences, as some content creators who comment on the
+posts in this subreddit [have pointed
+out.](https://www.youtube.com/watch?v=FPFJmupFg7k&t=1396s) Even with the
+entire post, there is always the possibility of the introduction of bias
+from the original poster leaving out key information or (even
+subconsciously) making themselves appear to be more innocent than they
+actually are, and as random strangers on the internet we will never
+understand the true extent of a particular story. However, with the
+power of machine learning, I will attempt to predict the judgments a
+particular post will receive and really get to the bottom of what makes
+someone the asshole.
+
+## Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+### Importing packages
+
+```{r}
+library(textrecipes) # allows text processing steps in recipe
+library(readxl) # read the data file (xlsx file)
+# tidyverse packages
+library(tidymodels) 
+library(tidyverse)
+library(tidytext)
+tidymodels_prefer() 
+library(themis)
+# special matrix package
+library(quanteda)
+library(widyr)
+library(furrr)
+# text processing packages
+library(textdata)
+library(tokenizers) 
+# stopwords packages
+library(stopwords)
+library(SnowballC)
+# pairwise association graphing
+library(igraph)
+library(ggraph)
+library(irlba)
+# SVM model packages
+library(LiblineaR)
+library(kernlab)
+```
+
+### Reading in data
+
+I gathered around 3000 posts and their related data using Python to
+access the Reddit API, then manually stitched together and cleaned the
+data in a separate file. I will load in the data here.
+
+```{r}
+df <- read_xlsx('data_collection/aita_dataset_final.xlsx')
+colnames(df)[1] = 'post_number'
+head(df)
+```
+
+## EDA
+
+### Breakdown of the judgments
+
+```{r}
+library(visdat)
+vis_miss(df)
+```
+
+I made sure to get rid of missing values in the variables I will be
+using as predictors and the response variable (judgment).
+
+```{r}
+df$judgment[df$judgment=="YWBTA"] <- "YTA"
+df$judgment[df$judgment=="YWNBTA"] <- "NTA"
+df$judgment <- as.factor(df$judgment)
+df$judgment <- droplevels(df$judgment, exclude = c('YWBTA','YWNBTA'))
+#summary(df['judgment'])
+
+df %>% 
+  ggplot(aes
+            (x = (forcats::fct_infreq(judgment)),
+             y = after_stat(count)/sum(after_stat(count))
+             )
+         ) +
+  geom_bar() +
+  labs(x= "Judgment", y = "Proportion of All Judgments")
+```
+
+The NTA judgment is definitely overrepresented, composing nearly 80% of
+the data. It's great that the vast majority of people who post on the
+subreddit aren't actually in the wrong, but it does mean that I need to
+account for that in my model training.
+
+### Tokenization
+
+The text data (posts and titles) is currently stored as sentences and
+paragraphs. In order to analyze the text data, we need to separate the
+words in it, a process known as tokenization.
+
+```{r}
+post_text_vector = df %>% pull('post_text')
+post_tokenized_vector = tokenize_words(post_text_vector)
+
+title_text_vector = df %>% pull('title')
+title_tokenized_vector = tokenize_words(title_text_vector)
+
+post_tokenized_vector %>% head() %>% glimpse()
+title_tokenized_vector %>% head() %>% glimpse()
+```
+
+### Checking the most common words used
+
+```{r}
+title_words_df <- df %>%
+  unnest_tokens(word, title) %>% 
+  filter(!grepl('[0-9]', word))
+title_words_df %>%
+  count(word) %>%
+  # group_by(post_number) %>%
+  arrange(desc(n)) %>%
+  slice(1:20)
+```
+
+```{r}
+post_words_df <- df %>%
+  unnest_tokens(word, post_text) %>% 
+  filter(!grepl('[0-9]', word))
+post_words_df %>%
+  count(word) %>%
+  # group_by(post_number) %>%
+  arrange(desc(n)) %>%
+  slice(1:20)
+```
+
+The most common words in the posts and titles are composed of words that
+can be considered "filler words", such as pronouns and articles. While
+numbers that represent the ages of the poster and involved parties can
+be useful in predicting who is in the wrong, I find it simpler to remove
+them altogether due to inconsistencies in how they're encoded in the
+posts and titles. We can remove these words by using a list of
+"stopwords" and remove the numbers as well. R has packages that can do
+this.
+
+### Taking out stopwords from the data
+
+```{r}
+# premade stopwords lists mentioned in the smltar book (from least to most strict)
+# snowball, smart, stopwords-iso
+
+post_stopwords <- df %>%
+                        unnest_tokens(word, post_text) %>%  
+                        filter(!grepl('[0-9]', word)) %>%
+                        anti_join(get_stopwords(source = "stopwords-iso"))
+post_stopwords
+```
+
+```{r}
+title_stopwords <- df %>%
+                        unnest_tokens(word, title) %>%
+                        filter(!grepl('[0-9]', word)) %>%
+                        anti_join(get_stopwords(source = "stopwords-iso"))
+title_stopwords
+```
+
+```{r}
+# proportion of words that were not removed by stopword removal compared to the original
+dim(title_stopwords %>% count(word))[1] / dim(title_words_df %>% count(word))[1]
+dim(post_stopwords %>% count(word))[1] / dim(post_words_df %>% count(word))[1]
+```
+
+Removing stopwords and numbers reduced the total number of unique words
+for both posts and titles, but not by a large amount.
+
+### Stemming
+
+Another way that we can further clean the text data is by using
+stemming. This collapses together related words like "tell" and
+"telling" into a single "stem" that they share ("tell"). However, the
+stems themselves might be different from the base word.
+
+```{r}
+# most common stems for each post
+post_stopwords_stemmed <- post_stopwords %>%
+                                mutate(stem = wordStem(word)) %>%
+                                count(post_number, stem, sort = TRUE)
+
+post_stopwords_stemmed
+```
+
+For this data, I won't stem words, since the stems don't make as much
+sense in terms of meaning and there are a lot of unique words in this
+data anyway.
+
+### Most common words (after removing stopwords)
+
+```{r}
+post_stopwords %>%
+  count(word) %>%
+  arrange(desc(n))
+```
+
+```{r}
+title_stopwords %>%
+  count(word) %>%
+  arrange(desc(n))
+```
+
+We can also look at the most common words within each post and title:
+
+```{r}
+# most common words by post  
+post_stopwords %>%
+  count(post_number, word) %>%
+  group_by(post_number) %>%
+  arrange(desc(n)) %>%
+  slice(1:5)
+```
+
+```{r}
+# most common words by title
+title_stopwords %>%
+  count(post_number, word) %>%
+  group_by(post_number) %>%
+  arrange(desc(n)) %>%
+  slice(1:5)
+```
+
+```{r, eval=FALSE, include=FALSE}
+### Creating document frequency matrix
+post_dfm_matrix <- df %>%
+  unnest_tokens(word, post_text) %>%
+  filter(!grepl('[0-9]', word)) %>%
+  anti_join(get_stopwords(source = 'stopwords-iso'), by = 'word') %>%
+  mutate(stem = wordStem(word)) %>%
+  count(post_number, stem) %>%
+  cast_dfm(post_number, stem, n)
+post_dfm_matrix
+```
+
+```{r, eval=FALSE, include=FALSE}
+title_dfm_matrix <- df %>%
+  unnest_tokens(word, title) %>%
+  anti_join(get_stopwords(), by = 'word') %>%  
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(stem = wordStem(word)) %>%
+  count(post_number, stem) %>%
+  cast_dfm(post_number, stem, n)
+title_dfm_matrix
+```
+
+```{r, eval=FALSE, include=FALSE}
+### Looking at ngrams
+post_token_ngram <- tokenize_ngrams(x = post_text_vector,
+                                   lowercase = TRUE,
+                                   n = 3L, #max number of words per ngram
+                                   n_min = 1L, #min number of words per ngram
+                                   stopwords = character(),
+                                   ngram_delim = c(" ", "(",")"),
+                                   simplify = FALSE)
+post_token_ngram %>% head() %>% glimpse()
+```
+
+```{r, eval=FALSE, include=FALSE}
+title_token_ngram <- tokenize_ngrams(x = title_text_vector,
+                                   lowercase = TRUE,
+                                   n = 3L, #max number of words per ngram
+                                   n_min = 1L, #min number of words per ngram
+                                   stopwords = character(),
+                                   ngram_delim = " ",
+                                   simplify = FALSE)
+title_token_ngram %>% head() %>% glimpse()
+```
+
+We can visualize at the most common pairs of words that show up
+together. Code from this section of ["Text Mining With
+R"](https://www.tidytextmining.com/nasa#word-co-ocurrences-and-correlations).\
+
+### Pairwise word associations
+
+```{r}
+post_word_pairs <- post_stopwords %>%
+                pairwise_count(word, post_number, sort = TRUE, upper = FALSE)
+post_word_pairs
+```
+
+```{r}
+title_word_pairs <- title_stopwords %>%
+                pairwise_count(word, post_number, sort = TRUE, upper = FALSE)
+title_word_pairs
+```
+
+Graphing the pairwise associations:
+
+```{r}
+set.seed(27)
+post_word_pairs %>%
+  filter(n >= 550) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n, edge_width = n), edge_colour = "purple1") +
+  geom_node_point(size = 2) +
+  geom_node_text(aes(label = name), repel = TRUE, 
+                 point.padding = unit(0.2, "lines")) +
+  theme_void()
+```
+
+```{r}
+title_word_pairs %>%
+  filter(n >= 50) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n, edge_width = n), edge_colour = "purple1") +
+  geom_node_point(size = 2) +
+  geom_node_text(aes(label = name), repel = TRUE, 
+                 point.padding = unit(0.2, "lines")) +
+  theme_void()
+```
+
+The words used are pretty centered around a select few pretty common
+ones. Notably, there are a lot of words pertaining to relationships
+(brother, daughter, girlfriend) and of course the name of the subreddit
+and the beginning of each title (AITA).
+
+### Text vectorization
+
+One way to represent the words is to convert them into vectors based on
+the number of times they show up in the document and the words that they
+tend to occur with. This code was drawn from [chapter 5.2 of
+SMLTAR](https://smltar.com/embeddings#understand-word-embeddings-by-finding-them-yourself).
+
+```{r}
+post_text_reduced <- df %>%
+  select(post_number, post_text) %>%
+  unnest_tokens(word, post_text) %>%
+  filter(!grepl('[0-9]', word)) %>%
+  add_count(word) %>%
+  # filter(n >= 50) %>%
+  select(-n)
+
+post_nested_words <- post_text_reduced %>%
+  nest(words = c(word))
+
+post_nested_words
+```
+
+```{r}
+title_text_reduced <- df %>%
+  select(post_number, title) %>%
+  unnest_tokens(word, title) %>%
+  filter(!grepl('[0-9]', word)) %>%
+  add_count(word) %>%
+  # filter(n >= 50) %>%
+  select(-n)
+
+title_nested_words <- title_text_reduced %>%
+  nest(words = c(word))
+
+title_nested_words
+```
+
+```{r}
+slide_windows <- function(tbl, window_size) {
+  skipgrams <- slider::slide(
+    tbl, 
+    ~.x, 
+    .after = window_size - 1, 
+    .step = 1, 
+    .complete = TRUE
+  )
+  
+  safe_mutate <- safely(mutate)
+  
+  out <- map2(skipgrams,
+              1:length(skipgrams),
+              ~ safe_mutate(.x, window_id = .y))
+  
+  out %>%
+    transpose() %>%
+    pluck("result") %>%
+    compact() %>%
+    bind_rows()
+}
+```
+
+```{r, eval = FALSE}
+plan(multisession) 
+
+post_pmi <- post_nested_words %>%
+  mutate(words = future_map(words, slide_windows, 4L)) %>%
+  unnest(words) %>%
+  unite(window_id, post_number, window_id) %>%
+  pairwise_pmi(word, window_id)
+
+post_pmi
+save(post_pmi,file="post_pmi.Rda")
+```
+
+```{r, eval = FALSE}
+plan(multisession)  
+
+title_pmi <- title_nested_words %>%
+  mutate(words = future_map(words, slide_windows, 4L)) %>%
+  unnest(words) %>%
+  unite(window_id, post_number, window_id) %>%
+  pairwise_pmi(word, window_id)
+
+title_pmi
+
+save(title_pmi,file="title_pmi.Rda")
+```
+
+```{r}
+load(file = 'title_pmi.Rda')
+load(file = 'post_pmi.Rda')
+```
+
+```{r, eval=FALSE}
+post_word_vectors <- post_pmi %>%
+  widely_svd(
+    item1, item2, pmi,
+    nv = 100, maxit = 1000
+  )
+
+post_word_vectors
+save(post_word_vectors,file="post_word_vectors.Rda")
+```
+
+```{r, eval=FALSE}
+title_word_vectors <- title_pmi %>%
+  widely_svd(
+    item1, item2, pmi,
+    nv = 100, maxit = 1000
+  )
+
+title_word_vectors
+save(title_word_vectors,file="title_word_vectors.Rda")
+```
+
+```{r}
+nearest_neighbors <- function(df, token) {
+  df %>%
+    widely(
+      ~ {
+        y <- .[rep(token, nrow(.)), ]
+        res <- rowSums(. * y) / 
+          (sqrt(rowSums(. ^ 2)) * sqrt(sum(.[token, ] ^ 2)))
+        
+        matrix(res, ncol = 1, dimnames = list(x = names(res)))
+      },
+      sort = TRUE
+    )(item1, dimension, value) %>%
+    select(-item2)
+}
+```
+
+```{r}
+load(file = 'post_word_vectors.Rda')
+post_word_vectors %>%
+  nearest_neighbors("happy")
+```
+
+```{r, eval=FALSE, include=FALSE}
+### converting to document embeddings
+post_word_matrix <- post_words_df %>%
+  count(post_number, word) %>%
+  cast_sparse(post_number, word, n)
+
+post_embedding_matrix <- post_word_vectors %>%
+  cast_sparse(item1, dimension, value)
+
+post_doc_matrix <- post_word_matrix %*% post_embedding_matrix
+
+dim(post_doc_matrix)
+```
+
+```{r, eval=FALSE, include = FALSE}
+# for some reason the matrix multiplication doesn't work for this one
+title_word_matrix <- title_words_df %>%
+  count(post_number, word) %>%
+  cast_sparse(post_number, word, n)
+
+title_embedding_matrix <- title_word_vectors %>%
+  cast_sparse(item1, dimension, value)
+
+title_doc_matrix <- title_word_matrix %*% title_embedding_matrix
+
+dim(title_doc_matrix)
+```
+
+```{r, eval = FALSE, include = FALSE}
+glimpse(post_doc_matrix)
+```
+
+After looking at training custom word embeddings on this data, I feel
+like this dataset is too small for it to work accurately. For example,
+the closest related word to "happy" is "worried", followed by some more
+words relating to emotions, but many of them are more similar to "sad"
+than "happy". This is understandable because people generally aren't
+expressing happiness on this subreddit.
+
+### Downloading pretrained word embedding
+
+```{r}
+glove6b <- embedding_glove6b(dimensions = 100,
+                             dir = "/Users/trac.k.y/Documents/pstat131/aita",
+                             return_path = TRUE,
+                             manual_download = TRUE)
+glove6b
+```
+
+### Tidying the GloVe embeddings a bit
+
+```{r}
+tidy_glove <- glove6b %>%
+  pivot_longer(contains("d"),
+               names_to = "dimension") %>%
+  rename(item1 = token)
+
+tidy_glove
+```
+
+### Modifying nearest neighbors function to work for GloVe embeddings
+
+```{r}
+nearest_neighbors_glove <- function(df, token) {
+  df %>%
+    widely(
+      ~ {
+        y <- .[rep(token, nrow(.)), ]
+        res <- rowSums(. * y) / 
+          (sqrt(rowSums(. ^ 2)) * sqrt(sum(.[token, ] ^ 2)))
+        matrix(res, ncol = 1, dimnames = list(x = names(res)))
+      },
+      sort = TRUE,
+      maximum_size = NULL
+    )(item1, dimension, value) %>%
+    select(-item2)
+}
+```
+
+```{r}
+tidy_glove %>%
+  nearest_neighbors_glove("happy")
+```
+
+This looks a bit better than the custom word embeddings.\
+
+We can use the embeddings to turn the data into a matrix.
+
+```{r}
+tidy_post_words <- df %>%
+  select(post_number, post_text) %>%
+  unnest_tokens(word, post_text) %>%
+  filter(!grepl('[0-9]', word)) %>%
+  anti_join(stop_words) %>%
+  add_count(word) %>%
+  filter(n >= 50) %>%
+  select(-n)
+
+word_matrix <- tidy_post_words %>%
+  inner_join(by = "word",
+             tidy_glove %>%
+               distinct(item1) %>%
+               rename(word = item1)) %>%
+  count(post_number, word) %>%
+  cast_sparse(post_number, word, n)
+
+glove_matrix <- tidy_glove %>%
+  inner_join(by = "item1",
+             tidy_post_words %>%
+               distinct(word) %>%
+               rename(item1 = word)) %>%
+  cast_sparse(item1, dimension, value)
+
+post_doc_matrix <- word_matrix %*% glove_matrix
+
+glimpse(post_doc_matrix)
+```
+
+```{r}
+tidy_title_words <- df %>%
+  select(post_number, title) %>%
+  unnest_tokens(word, title) %>%
+  filter(!grepl('[0-9]', word)) %>%
+  anti_join(stop_words) %>%
+  add_count(word) %>%
+  filter(n >= 50) %>%
+  select(-n)
+
+title_word_matrix <- tidy_title_words %>%
+  inner_join(by = "word",
+             tidy_glove %>%
+               distinct(item1) %>%
+               rename(word = item1)) %>%
+  count(post_number, word) %>%
+  cast_sparse(post_number, word, n)
+
+title_glove_matrix <- tidy_glove %>%
+  inner_join(by = "item1",
+             tidy_title_words %>%
+               distinct(word) %>%
+               rename(item1 = word)) %>%
+  cast_sparse(item1, dimension, value)
+
+title_doc_matrix <- title_word_matrix %*% title_glove_matrix
+glimpse(title_doc_matrix)
+```
+
+The original dataset had 3130 entries, some posts and titles got removed
+because they did not have any words in common with the GloVe embeddings.
+
+## Model training
+
+To train the model, I will split the data into training and testing
+sets. Since this is a relatively small dataset, I will leave most of the
+data (80%) for training the models on. The testing set will be used to
+evaluate model performance on data that it has not been trained on or
+seen before. I will also be using cross-validation, which splits the
+training data into multiple parts and simulates the training-testing
+dynamic within the training data. This will help give an accurate
+preliminary estimate of how the models will do on the testing data.
+
+### Splitting training data
+
+```{r}
+set.seed(123)
+df_split <- initial_split(df, strata = judgment, prop = 0.8)
+df_train <- training(df_split)
+df_test <- testing(df_split)
+df_train$judgment <- droplevels(df_train$judgment, exclude = c('YWBTA','YWNBTA'))
+df_test$judgment <- droplevels(df_test$judgment, exclude = c('YWBTA','YWNBTA'))
+
+df_folds <- vfold_cv(df_train, v = 5, strata = judgment)
+```
+
+### Setting up recipe
+
+The steps we took to tokenize and vectorize the text data can be done in
+a tidymodels recipe with the help of the `textrecipes` package.
+
+```{r}
+word_embeddings_recipe <- 
+  recipe(judgment ~ title + post_text + upvote_percentage + num_comments,
+                data = df_train) %>%
+                step_upsample(judgment, over_ratio = 0.4, skip=TRUE) %>%
+                step_tokenize(post_text) %>%
+                step_stopwords(post_text, stopword_source='stopwords-iso') %>%
+                step_word_embeddings(post_text, embeddings = glove6b) %>%
+                step_tokenize(title) %>%
+                step_stopwords(title, stopword_source='stopwords-iso') %>%
+                step_word_embeddings(title, embeddings = glove6b) %>%
+                step_normalize(all_predictors())
+
+word_embeddings_recipe %>% prep() %>% bake(new_data=df_train)
+```
+
+```{r, eval = FALSE, include = FALSE}
+tf_recipe <-
+  recipe(judgment ~ title + post_text + upvote_percentage + num_comments,
+                     data = df_train) %>%
+  step_upsample(judgment, over_ratio = 0.4, skip=TRUE) %>%
+  step_tokenize(post_text) %>%
+  step_stopwords(post_text, stopword_source = 'stopwords-iso') %>%
+  step_tokenfilter(post_text, max_tokens = 1e3) %>%
+  step_tfidf(post_text) %>%
+  step_tokenize(title) %>%
+  step_stopwords(title, stopword_source = 'stopwords-iso') %>%
+  step_tokenfilter(title, max_tokens = 1e3) %>%
+  step_tfidf(title)
+tf_recipe %>% prep() %>% bake(new_data=df_train)
+# %>% group_by(judgment) %>% summarise(count = n())
+```
+
+### Model fitting
+
+I will fit a k-nearest neighbors, support vector machines based on a
+polynomial and a radial basis function, and a random forest model to
+this data. The SMLTAR book mentioned that while they are not as widely
+applicable as models such as aggregated tree models, SVMs have some
+properties that actually make them quite suited to doing classification
+on text data ([briefly explained in this conference paper the book
+cited](https://link.springer.com/chapter/10.1007/BFb0026683)).
+
+#### KNN model
+
+```{r}
+knn_class <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+knn_grid <- grid_regular(dials::neighbors(range = c(1, 1200)), levels = 20)
+
+knn_wf <- workflow() %>% 
+  add_recipe(word_embeddings_recipe) %>%
+  add_model(knn_class)
+
+knn_res <- tune_grid(
+  knn_wf,
+  resamples = df_folds, 
+  grid = knn_grid
+)
+```
+
+#### SVM polynomial
+
+```{r}
+svm_polynom <- svm_poly(degree = tune(), 
+                        cost = tune(), 
+                        scale_factor = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kernlab")
+
+svm_poly_grid <- grid_regular(dials::degree(range = c(1, 10)),
+                              cost(), 
+                              scale_factor(), 
+                              levels = 5)
+
+svm_poly_wf <- workflow() %>% 
+  add_recipe(word_embeddings_recipe) %>%
+  add_model(svm_polynom)
+```
+
+```{r, message = TRUE, eval = FALSE}
+svm_poly_res <- tune_grid(
+  svm_poly_wf,
+  resamples = df_folds, 
+  grid = svm_poly_grid,
+  control = control_grid(verbose = TRUE)
+)
+
+save(svm_poly_res,file="svm_poly_res.Rda")
+```
+
+#### SVM radial basis function
+
+```{r}
+svm_rbf_model <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kernlab")
+
+svm_rbf_wf <- workflow() %>% 
+  add_recipe(word_embeddings_recipe) %>%
+  add_model(svm_rbf_model)
+
+svm_rbf_grid <- grid_regular(cost(), 
+                             rbf_sigma(),
+                             levels = 4)
+```
+
+```{r, message = TRUE, eval = FALSE}
+svm_rbf_res <- tune_grid(
+  svm_rbf_wf,
+  resamples = df_folds, 
+  grid = svm_rbf_grid,
+  control = control_grid(verbose = TRUE)
+)
+
+save(svm_rbf_res, file = 'svm_rbf_res.Rda')
+```
+
+#### Random forest
+
+```{r}
+rf_model <- rand_forest(mtry = tune(), 
+                   trees = tune(),
+                   min_n = tune()) %>%
+  set_engine("ranger", importance = 'impurity') %>%
+  set_mode("classification")
+
+rf_grid <- grid_regular(mtry(range = c(1, 100)),
+                        trees(range = c(1, 50)),
+                        min_n(range = c(1, 20)),
+                        levels = 10)
+
+rf_wf <- workflow() %>% 
+  add_recipe(word_embeddings_recipe) %>%
+  add_model(rf_model)
+```
+
+```{r, eval = FALSE}
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = df_folds, 
+  grid = rf_grid
+)
+
+save(rf_res,file="rf_res.Rda")
+```
+
+### Evaluation of performance on cross-validation folds
+
+#### KNN model
+
+```{r}
+knn_metrics <- collect_metrics(knn_res)
+knn_metrics %>%
+  filter(.metric == "roc_auc") %>%
+  select(.metric, mean, std_err, neighbors)
+```
+
+```{r}
+autoplot(knn_res)
+```
+
+```{r}
+select_best(knn_res, metric = "roc_auc", neighbors)
+select_best(knn_res, metric = "accuracy", neighbors)
+```
+
+```{r}
+knn_roc_auc <- knn_metrics %>%
+  filter(.metric == "roc_auc")
+knn_roc_auc %>%
+  filter(mean == max(knn_roc_auc$mean)) %>%
+  select(.metric, neighbors, mean, std_err)
+```
+
+```{r}
+knn_final <- finalize_workflow(knn_wf, 
+                               select_best(knn_res, metric = "roc_auc", neighbors)) %>%
+  fit(df_train)
+
+knn_final_augmented <- augment(knn_final, new_data=df_train)
+
+knn_final_augmented %>%
+roc_curve(judgment, .pred_ESH:.pred_YTA) %>% 
+  autoplot()
+```
+
+```{r}
+autoplot(conf_mat(knn_final_augmented, 
+                  truth = judgment, 
+                  estimate = .pred_class), 
+         type = 'heatmap')
+```
+
+The KNN model did best with a higher number of neighbors. It's clear
+that the KNN model heavily overpredicts the NTA class even after some
+upsampling was done on the data. Since NTA is the most common class in
+the data, this is probably the primary cause of its ROC AUC being
+higher.
+
+#### SVM polynomial
+
+```{r}
+load(file = 'svm_poly_res.Rda')
+autoplot(svm_poly_res)
+ggsave('svm_poly_res.png', width=16, height=9)
+```
+
+![](svm_poly_res.png)
+
+It looks like a cost and scale factor in the middle is best, along with a polynomial border that is around cubic.
+
+```{r}
+select_best(svm_poly_res, metric = "roc_auc", degree, cost, scale_factor)
+select_best(svm_poly_res, metric = "accuracy", degree, cost, scale_factor)
+```
+
+```{r}
+svm_poly_metrics <- collect_metrics(svm_poly_res)
+svm_poly_roc_auc <- svm_poly_metrics %>%
+  filter(.metric == "roc_auc")
+svm_poly_roc_auc %>%
+  filter(mean == max(svm_poly_roc_auc$mean)) %>%
+  select(.metric, degree, cost, scale_factor, mean, std_err)
+```
+
+```{r}
+svm_poly_final <- finalize_workflow(svm_poly_wf, 
+                               select_best(svm_poly_res, metric = "roc_auc", 
+                                           degree, cost, scale_factor)) %>%
+  fit(df_train)
+
+svm_poly_augmented <- augment(svm_poly_final, new_data = df_train)
+
+svm_poly_augmented %>%
+roc_curve(judgment, .pred_ESH:.pred_YTA) %>% 
+  autoplot()
+```
+
+```{r}
+autoplot(conf_mat(svm_poly_augmented, 
+                  truth = judgment, 
+                  estimate = .pred_class), 
+         type = 'heatmap')
+```
+
+#### SVM radial basis function
+
+```{r}
+load(file = 'svm_rbf_res.Rda')
+autoplot(svm_rbf_res)
+```
+
+It looks like a combination of cost and radial sigma function values in
+the middle of the spectrum have the best results.
+
+```{r}
+select_best(svm_rbf_res, metric = "roc_auc", cost, rbf_sigma)
+select_best(svm_rbf_res, metric = "accuracy", cost, rbf_sigma)
+```
+
+```{r}
+svm_rbf_metrics <- collect_metrics(svm_rbf_res)
+svm_rbf_roc_auc <- svm_rbf_metrics %>%
+  filter(.metric == "roc_auc")
+svm_rbf_roc_auc %>%
+  filter(mean == max(svm_rbf_roc_auc$mean)) %>%
+  select(.metric, cost, rbf_sigma, mean, std_err)
+```
+
+```{r}
+svm_rbf_final <- finalize_workflow(svm_rbf_wf, 
+                               select_best(svm_rbf_res, metric = "roc_auc", 
+                                           cost, rbf_sigma)) %>%
+  fit(df_train)
+
+svm_rbf_augmented <- augment(svm_rbf_final, new_data = df_train)
+
+svm_rbf_augmented %>%
+roc_curve(judgment, .pred_ESH:.pred_YTA) %>% 
+  autoplot()
+```
+
+```{r}
+autoplot(conf_mat(svm_rbf_augmented, 
+                  truth = judgment, 
+                  estimate = .pred_class), 
+         type = 'heatmap')
+```
+
+Although both the SVM models had a higher ROC AUC value than KNN, this
+is due to them only predicting the NTA class.
+
+#### Random forest
+
+```{r}
+load(file = 'rf_res.Rda')
+rf_metrics <- collect_metrics(rf_res)
+rf_metrics %>%
+  filter(.metric == "roc_auc") %>%
+  select(.metric, mtry, trees, min_n, mean, std_err)
+```
+
+```{r, eval = FALSE}
+autoplot(rf_res)
+ggsave('rf_res.png', width=15, height=9)
+```
+
+![](rf_res.png)
+
+```{r}
+select_best(rf_res, metric = "roc_auc", mtry, trees, min_n)
+select_best(rf_res, metric = "accuracy", mtry, trees, min_n)
+```
+
+```{r}
+rf_roc_auc <- rf_metrics %>%
+  filter(.metric == "roc_auc")
+rf_roc_auc %>%
+  filter(mean == max(rf_roc_auc$mean)) %>%
+  select(.metric, mtry, trees, min_n, mean, std_err)
+```
+
+```{r}
+rf_final <- finalize_workflow(rf_wf, 
+                              select_best(rf_res, metric = "roc_auc", 
+                                          mtry, trees, min_n)) %>% 
+  fit(df_train)
+
+rf_final_augmented <- augment(rf_final, new_data=df_train)
+
+rf_final_augmented %>%
+roc_curve(judgment, .pred_ESH:.pred_YTA) %>% 
+  autoplot()
+```
+
+```{r}
+autoplot(conf_mat(rf_final_augmented, 
+                  truth = judgment, 
+                  estimate = .pred_class), 
+         type = 'heatmap')
+```
+
+The random forest model did the best out of all the models on the
+training data in terms of both ROC AUC and looking at the results shown
+in the confusion matrix. In training the model, more trees and a middle
+amount of predictors resulted in better performance. I'll choose this
+model with the tuned parameters that got the best ROC AUC value as my
+final model.
+
+## Evaluating final model on testing data
+
+```{r}
+rf_test_augmented <- augment(rf_final, new_data=df_test)
+
+roc_auc(rf_test_augmented, truth = judgment, .pred_ESH:.pred_YTA)
+```
+
+```{r}
+rf_test_augmented %>%
+roc_curve(judgment, .pred_ESH:.pred_YTA) %>% 
+  autoplot()
+```
+
+```{r}
+autoplot(conf_mat(rf_test_augmented, 
+                  truth = judgment, 
+                  estimate = .pred_class), 
+         type = 'heatmap')
+```
+
+```{r, include=FALSE, eval=FALSE}
+# the ONE post that got predicted as ESH
+rf_test_augmented[rf_test_augmented$.pred_class == 'ESH',]$post_text
+```
+
+The random forest model didn't perform as well on the testing set, but
+that's usually to be expected. It did completely get the ESH, INFO, and
+NAH classes wrong due to basically never predicting them, but did at
+least okay on the NTA and YTA classes.
+
+## Conclusion
+
+After testing all of these models, it's clear that this classification
+problem is hard to predict. By splitting the text data of the Reddit
+posts and titles into separate words, removing common filler words, and
+using pretrained word embeddings, I was able to reduce the number of
+features in the text data and convert them to vectors that could be
+analyzed by machine learning models while retaining as much of the
+original meaning and relationships as I could.
+
+Out of all the models I tried, the random forest model did the best, as
+it was able to almost perfectly classify the posts in the training data.
+It was also able to maintain decent performance on the NTA and YTA posts
+in the testing data, but not the ESH, NAH, and INFO ones. This is
+probably because of the imbalance of the post categories, with there
+being very few posts of those three categories to the point where
+performing upsampling on those post categories contained too many
+duplicates, causing overfitting on those classes.
+
+Ultimately the random forest model wasn't completely able to predict who
+was the asshole in each post, but neither can people, so it definitely
+has some potential. In the future, finding more posts of the minority
+categories to train it on could probably help its performance a lot.
